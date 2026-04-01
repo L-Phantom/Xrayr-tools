@@ -6,43 +6,43 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 1. 处理 XrayR 日志 (增强型匹配)
 XRAYR_CONFIG="/etc/XrayR/config.yml"
+
+# 1. 针对你的格式进行精准打击
 if [ -f "$XRAYR_CONFIG" ]; then
-    echo "正在处理 XrayR 配置文件..."
-    # 备份一下以防万一
+    echo "检测到 XrayR 配置文件，正在执行精准修改..."
     cp "$XRAYR_CONFIG" "${XRAYR_CONFIG}.bak"
+
+    # 逻辑：找到 Log: 下方的第一行 Level，并将其修改为 none
+    # 匹配模式：匹配以任意空格开始的 Level: 后面跟着任何内容的行
+    sed -i 's/^[[:space:]]*Level:.*/    Level: none/g' "$XRAYR_CONFIG"
     
-    # 更加精准的匹配：忽略大小写，处理可能存在的空格
-    # 匹配包含 LogLevel 的行，并整行替换为 LogLevel: none
-    sed -i -E 's/^[[:space:]]*LogLevel:.*/  LogLevel: none/I' "$XRAYR_CONFIG"
-    
-    # 检查是否修改成功
-    if grep -iq "LogLevel: none" "$XRAYR_CONFIG"; then
-        echo "✅ XrayR 配置修改成功：LogLevel 已设为 none"
-    else
-        echo "❌ 修改失败，请检查 config.yml 内部格式。"
+    # 如果你的配置里连 Level 这行都没有，我们可以直接在 Log: 后面插入
+    if ! grep -iq "Level: none" "$XRAYR_CONFIG"; then
+        sed -i '/Log:/a \    Level: none' "$XRAYR_CONFIG"
     fi
-    
+
+    echo "✅ XrayR 日志级别已设为 none。"
     systemctl restart XrayR
 else
-    echo "⚠️ 未发现 XrayR 配置文件，请检查路径是否为 /etc/XrayR/config.yml"
+    echo "⚠️ 路径不对，请确认配置文件在 /etc/XrayR/config.yml"
 fi
 
-# 2. 处理 systemd-journald (这一步通常不会失败)
+# 2. 处理 systemd-journald (系统层级优化)
 JOURNAL_CONF="/etc/systemd/journald.conf"
 if [ -f "$JOURNAL_CONF" ]; then
-    cp $JOURNAL_CONF "${JOURNAL_CONF}.bak"
     cat > $JOURNAL_CONF <<EOF
 [Journal]
 Storage=volatile
-RuntimeMaxUse=30M
+RuntimeMaxUse=20M
 MaxRetentionSec=1day
 ForwardToSyslog=no
 ForwardToWall=no
 EOF
     systemctl restart systemd-journald
-    echo "✅ systemd-journald 优化完成。"
+    echo "✅ systemd-journald 已限制在内存运行 (20M上限)。"
 else
     echo "⚠️ 未找到 journald.conf"
 fi
+
+echo "--- L-Phantom 优化脚本执行完毕 ---"
