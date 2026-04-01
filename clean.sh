@@ -1,33 +1,27 @@
 #!/bin/bash
 
-# 检查权限
-if [[ $EUID -ne 0 ]]; then
-   echo "请使用 root 权限运行此脚本。"
-   exit 1
-fi
-
+# 1. 精准处理 XrayR 的 Level 缩进
 XRAYR_CONFIG="/etc/XrayR/config.yml"
 
 if [ -f "$XRAYR_CONFIG" ]; then
-    echo "正在重新构建日志配置模块..."
-    # 备份
+    echo "正在修复空格缩进并关闭日志..."
     cp "$XRAYR_CONFIG" "${XRAYR_CONFIG}.bak"
 
-    # 第一步：删除原文件中从 "Log:" 开始到 "ConnectionConfig:" 之前的所有内容
-    # 第二步：在原来的位置插入我们标准的、关闭日志的配置
-    # 这样管你原来是 Level 还是 LogLevel，全部推倒重来
+    # 这里的正则含义：匹配行首开始的任意空格，紧跟 Level:，然后把整行换掉
+    # 我们尝试用最标准的 2 空格缩进，如果你的环境特殊，这一行也能强行纠正它
+    sed -i -E 's/^[[:space:]]*Level:.*/  Level: none/g' "$XRAYR_CONFIG"
     
-    # 创建一个临时文件来重新组装配置
-    sed -i '/^Log:/,/^ConnectionConfig:/c\Log:\n  Level: none\n  AccessPath: # /etc/XrayR/access.Log\n  ErrorPath: # /etc/XrayR/error.log\n\nDnsConfigPath: # /etc/XrayR/dns.json\n\nConnectionConfig:' "$XRAYR_CONFIG"
+    # 同时也把 AccessPath 和 ErrorPath 的注释前面对齐
+    sed -i -E 's/^[[:space:]]*AccessPath:.*/  AccessPath: #/g' "$XRAYR_CONFIG"
+    sed -i -E 's/^[[:space:]]*ErrorPath:.*/  ErrorPath: #/g' "$XRAYR_CONFIG"
 
-    echo "✅ XrayR 配置已重写，LogLevel 强制设为 none。"
+    echo "✅ 缩进已修正，Level 已设为 none。"
     systemctl restart XrayR
 else
-    echo "⚠️ 找不到配置文件！"
+    echo "❌ 找不到文件！"
 fi
 
-# 优化系统日志 (针对 systemd-journald)
-echo "正在深度清理系统日志占用..."
+# 2. 系统日志限流 (这个部分不需要改，保持强力压缩)
 JOURNAL_CONF="/etc/systemd/journald.conf"
 if [ -f "$JOURNAL_CONF" ]; then
     cat > $JOURNAL_CONF <<EOF
@@ -38,10 +32,7 @@ MaxRetentionSec=1h
 ForwardToSyslog=no
 ForwardToWall=no
 EOF
-    # 清理现有的 journal 日志
     journalctl --vacuum-time=1s
     systemctl restart systemd-journald
-    echo "✅ 系统日志已锁定在内存 (10M上限) 并清空历史。"
+    echo "✅ systemd-journald 限制已生效。"
 fi
-
-echo "--- 任务完成，L-Phantom 祝你节点稳如老狗 ---"
