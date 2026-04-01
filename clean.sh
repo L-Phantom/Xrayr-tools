@@ -8,41 +8,40 @@ fi
 
 XRAYR_CONFIG="/etc/XrayR/config.yml"
 
-# 1. 针对你的格式进行精准打击
 if [ -f "$XRAYR_CONFIG" ]; then
-    echo "检测到 XrayR 配置文件，正在执行精准修改..."
+    echo "正在重新构建日志配置模块..."
+    # 备份
     cp "$XRAYR_CONFIG" "${XRAYR_CONFIG}.bak"
 
-    # 逻辑：找到 Log: 下方的第一行 Level，并将其修改为 none
-    # 匹配模式：匹配以任意空格开始的 Level: 后面跟着任何内容的行
-    sed -i 's/^[[:space:]]*Level:.*/    Level: none/g' "$XRAYR_CONFIG"
+    # 第一步：删除原文件中从 "Log:" 开始到 "ConnectionConfig:" 之前的所有内容
+    # 第二步：在原来的位置插入我们标准的、关闭日志的配置
+    # 这样管你原来是 Level 还是 LogLevel，全部推倒重来
     
-    # 如果你的配置里连 Level 这行都没有，我们可以直接在 Log: 后面插入
-    if ! grep -iq "Level: none" "$XRAYR_CONFIG"; then
-        sed -i '/Log:/a \    Level: none' "$XRAYR_CONFIG"
-    fi
+    # 创建一个临时文件来重新组装配置
+    sed -i '/^Log:/,/^ConnectionConfig:/c\Log:\n  Level: none\n  AccessPath: # /etc/XrayR/access.Log\n  ErrorPath: # /etc/XrayR/error.log\n\nDnsConfigPath: # /etc/XrayR/dns.json\n\nConnectionConfig:' "$XRAYR_CONFIG"
 
-    echo "✅ XrayR 日志级别已设为 none。"
+    echo "✅ XrayR 配置已重写，LogLevel 强制设为 none。"
     systemctl restart XrayR
 else
-    echo "⚠️ 路径不对，请确认配置文件在 /etc/XrayR/config.yml"
+    echo "⚠️ 找不到配置文件！"
 fi
 
-# 2. 处理 systemd-journald (系统层级优化)
+# 优化系统日志 (针对 systemd-journald)
+echo "正在深度清理系统日志占用..."
 JOURNAL_CONF="/etc/systemd/journald.conf"
 if [ -f "$JOURNAL_CONF" ]; then
     cat > $JOURNAL_CONF <<EOF
 [Journal]
 Storage=volatile
-RuntimeMaxUse=20M
-MaxRetentionSec=1day
+RuntimeMaxUse=10M
+MaxRetentionSec=1h
 ForwardToSyslog=no
 ForwardToWall=no
 EOF
+    # 清理现有的 journal 日志
+    journalctl --vacuum-time=1s
     systemctl restart systemd-journald
-    echo "✅ systemd-journald 已限制在内存运行 (20M上限)。"
-else
-    echo "⚠️ 未找到 journald.conf"
+    echo "✅ 系统日志已锁定在内存 (10M上限) 并清空历史。"
 fi
 
-echo "--- L-Phantom 优化脚本执行完毕 ---"
+echo "--- 任务完成，L-Phantom 祝你节点稳如老狗 ---"
