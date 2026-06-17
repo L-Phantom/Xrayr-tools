@@ -9,6 +9,9 @@ DRY_RUN=0
 NO_RESTART=0
 TRUNCATE_LOGS=1
 ROLLBACK_DIR=""
+PROFILE="safe"
+EGRESS_MBIT=""
+NO_TC=0
 
 usage() {
   cat <<'EOF'
@@ -16,6 +19,9 @@ Usage:
   bash xrayr-optimize.sh [options]
 
 Options:
+  --profile NAME         safe, balanced, or saturated. Default: safe
+  --egress-mbit N        Optional egress shaping rate in Mbit/s, for example 930
+  --no-tc                Do not apply runtime qdisc/txqueuelen tuning
   --dry-run              Print planned actions without changing files
   --no-restart           Do not restart XrayR/systemd services
   --no-truncate-logs     Do not truncate existing XrayR logs
@@ -26,6 +32,8 @@ What this script optimizes:
   - XrayR config: disable file logs and REALITY debug "Show"
   - systemd: raise NOFILE/NPROC/TasksMax for XrayR
   - sysctl: apply conservative network/file-descriptor tuning
+  - saturated profile: apply runtime fq qdisc/txqueuelen tuning
+  - optional shaping: limit egress to --egress-mbit with htb+fq
   - logrotate: rotate /var/log/XrayR/*.log at 50M, keep 3 compressed copies
   - journald: cap journal disk/memory usage without overwriting the main config
   - logs: safely truncate existing oversized XrayR *.log files by default
@@ -48,6 +56,17 @@ run() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --profile)
+      shift
+      [ "${1:-}" ] || die "--profile requires a value"
+      PROFILE="$1"
+      ;;
+    --egress-mbit)
+      shift
+      [ "${1:-}" ] || die "--egress-mbit requires a value"
+      EGRESS_MBIT="$1"
+      ;;
+    --no-tc) NO_TC=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --no-restart) NO_RESTART=1 ;;
     --no-truncate-logs) TRUNCATE_LOGS=0 ;;
@@ -63,6 +82,18 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
+
+case "$PROFILE" in
+  safe|balanced|saturated) ;;
+  *) die "--profile must be safe, balanced, or saturated" ;;
+esac
+
+if [ "$EGRESS_MBIT" ]; then
+  case "$EGRESS_MBIT" in
+    *[!0-9]*|'') die "--egress-mbit must be a positive integer" ;;
+  esac
+  [ "$EGRESS_MBIT" -gt 0 ] || die "--egress-mbit must be greater than 0"
+fi
 
 detect_service() {
   if systemctl list-unit-files XrayR.service >/dev/null 2>&1; then
@@ -131,6 +162,7 @@ fi
 
 systemctl daemon-reload || true
 systemctl restart systemd-journald || true
+systemctl disable --now xrayr-net-tune.service >/dev/null 2>&1 || true
 systemctl restart "$SERVICE_UNIT" || true
 log "rollback complete"
 EOF
@@ -190,6 +222,7 @@ rollback() {
   if [ "$NO_RESTART" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
     systemctl daemon-reload || true
     systemctl restart systemd-journald || true
+    systemctl disable --now xrayr-net-tune.service >/dev/null 2>&1 || true
     systemctl restart "$SERVICE_UNIT" || true
   fi
   log "rollback complete"
@@ -298,7 +331,7 @@ ForwardToWall=no'
 }
 
 install_sysctl() {
-  local cc qdisc extra=""
+  local cc extra="" backlog syn_backlog somax local_range fin_timeout keepalive_time rmem_max wmem_max netdev_budget=""
   cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
   if printf '%s' "$cc" | grep -qw bbr; then
     extra='
@@ -308,24 +341,116 @@ net.ipv4.tcp_congestion_control = bbr'
     log "BBR not available; leaving congestion control unchanged"
   fi
 
+  case "$PROFILE" in
+    safe)
+      backlog=250000
+      syn_backlog=65535
+      somax=65535
+      local_range="10000 65000"
+      fin_timeout=15
+      keepalive_time=600
+      rmem_max=67108864
+      wmem_max=67108864
+      ;;
+    balanced)
+      backlog=250000
+      syn_backlog=131072
+      somax=65535
+      local_range="10000 65000"
+      fin_timeout=12
+      keepalive_time=480
+      rmem_max=134217728
+      wmem_max=134217728
+      netdev_budget='
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000'
+      ;;
+    saturated)
+      backlog=500000
+      syn_backlog=262144
+      somax=131072
+      local_range="10000 65535"
+      fin_timeout=10
+      keepalive_time=300
+      rmem_max=134217728
+      wmem_max=134217728
+      netdev_budget='
+net.core.netdev_budget = 1200
+net.core.netdev_budget_usecs = 10000'
+      ;;
+  esac
+
   local content
   content="# Managed by xrayr-optimize
 fs.file-max = 1048576
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 250000
-net.ipv4.ip_local_port_range = 10000 65000
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 600
+net.core.somaxconn = ${somax}
+net.core.netdev_max_backlog = ${backlog}
+net.ipv4.ip_local_port_range = ${local_range}
+net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
+net.ipv4.tcp_fin_timeout = ${fin_timeout}
+net.ipv4.tcp_keepalive_time = ${keepalive_time}
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864${extra}"
+net.ipv4.tcp_rmem = 4096 87380 ${rmem_max}
+net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_max = ${wmem_max}${netdev_budget}${extra}"
   write_file "/etc/sysctl.d/99-xrayr-performance.conf" "$content"
+}
+
+detect_default_iface() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+install_tc_service() {
+  [ "$NO_TC" -eq 0 ] || { log "skip tc tuning due to --no-tc"; return 0; }
+  local iface ip_bin tc_bin
+  iface="$(detect_default_iface || true)"
+  [ "$iface" ] || { log "skip tc tuning: cannot detect default interface"; return 0; }
+  ip_bin="$(command -v ip || true)"
+  tc_bin="$(command -v tc || true)"
+  [ "$ip_bin" ] || { log "skip tc tuning: ip command not found"; return 0; }
+  [ "$tc_bin" ] || { log "skip tc tuning: tc command not found"; return 0; }
+
+  local cmd txqlen service_content
+  case "$PROFILE" in
+    safe) txqlen=1000 ;;
+    balanced) txqlen=5000 ;;
+    saturated) txqlen=10000 ;;
+  esac
+
+  if [ "$EGRESS_MBIT" ]; then
+    cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root handle 1: htb default 10; ${tc_bin} class replace dev ${iface} parent 1: classid 1:10 htb rate ${EGRESS_MBIT}mbit ceil ${EGRESS_MBIT}mbit; ${tc_bin} qdisc replace dev ${iface} parent 1:10 handle 10: fq"
+  elif [ "$PROFILE" = "safe" ]; then
+    cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root fq || true"
+  else
+    cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root fq || true"
+  fi
+
+  service_content="[Unit]
+Description=XrayR network queue tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '${cmd}'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target"
+  write_file "/etc/systemd/system/xrayr-net-tune.service" "$service_content"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "DRY-RUN: would apply tc tuning on ${iface}"
+    return 0
+  fi
+
+  systemctl daemon-reload || true
+  systemctl enable xrayr-net-tune.service >/dev/null 2>&1 || true
+  systemctl restart xrayr-net-tune.service || true
 }
 
 truncate_xrayr_logs() {
@@ -354,6 +479,7 @@ apply_changes() {
   install_logrotate
   install_journald_limits
   install_sysctl
+  install_tc_service
   truncate_xrayr_logs
 
   if [ "$DRY_RUN" -eq 1 ]; then
