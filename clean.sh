@@ -10,7 +10,6 @@ NO_RESTART=0
 TRUNCATE_LOGS=1
 ROLLBACK_DIR=""
 PROFILE="safe"
-EGRESS_MBIT=""
 NO_TC=0
 
 usage() {
@@ -20,7 +19,6 @@ Usage:
 
 Options:
   --profile NAME         safe, balanced, or saturated. Default: safe
-  --egress-mbit N        Optional egress shaping rate in Mbit/s, for example 930
   --no-tc                Do not apply runtime qdisc/txqueuelen tuning
   --dry-run              Print planned actions without changing files
   --no-restart           Do not restart XrayR/systemd services
@@ -33,7 +31,6 @@ What this script optimizes:
   - systemd: raise NOFILE/NPROC/TasksMax for XrayR
   - sysctl: apply conservative network/file-descriptor tuning
   - saturated profile: apply runtime fq qdisc/txqueuelen tuning
-  - optional shaping: limit egress to --egress-mbit with htb+fq
   - logrotate: rotate /var/log/XrayR/*.log at 50M, keep 3 compressed copies
   - journald: cap journal disk/memory usage without overwriting the main config
   - logs: safely truncate existing oversized XrayR *.log files by default
@@ -61,11 +58,6 @@ while [ "$#" -gt 0 ]; do
       [ "${1:-}" ] || die "--profile requires a value"
       PROFILE="$1"
       ;;
-    --egress-mbit)
-      shift
-      [ "${1:-}" ] || die "--egress-mbit requires a value"
-      EGRESS_MBIT="$1"
-      ;;
     --no-tc) NO_TC=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --no-restart) NO_RESTART=1 ;;
@@ -87,13 +79,6 @@ case "$PROFILE" in
   safe|balanced|saturated) ;;
   *) die "--profile must be safe, balanced, or saturated" ;;
 esac
-
-if [ "$EGRESS_MBIT" ]; then
-  case "$EGRESS_MBIT" in
-    *[!0-9]*|'') die "--egress-mbit must be a positive integer" ;;
-  esac
-  [ "$EGRESS_MBIT" -gt 0 ] || die "--egress-mbit must be greater than 0"
-fi
 
 detect_service() {
   if systemctl list-unit-files XrayR.service >/dev/null 2>&1; then
@@ -421,13 +406,7 @@ install_tc_service() {
     saturated) txqlen=10000 ;;
   esac
 
-  if [ "$EGRESS_MBIT" ]; then
-    cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root handle 1: htb default 10; ${tc_bin} class replace dev ${iface} parent 1: classid 1:10 htb rate ${EGRESS_MBIT}mbit ceil ${EGRESS_MBIT}mbit; ${tc_bin} qdisc replace dev ${iface} parent 1:10 handle 10: fq"
-  elif [ "$PROFILE" = "safe" ]; then
-    cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root fq || true"
-  else
-    cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root fq || true"
-  fi
+  cmd="${ip_bin} link set dev ${iface} txqueuelen ${txqlen}; ${tc_bin} qdisc replace dev ${iface} root fq || true"
 
   service_content="[Unit]
 Description=XrayR network queue tuning
