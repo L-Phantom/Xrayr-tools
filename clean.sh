@@ -29,7 +29,7 @@ Options:
 What this script optimizes:
   - XrayR config: disable file logs and REALITY debug "Show"
   - systemd: raise NOFILE/NPROC/TasksMax for XrayR
-  - sysctl: apply conservative network/file-descriptor tuning
+  - sysctl: apply conservative network/file-descriptor/conntrack tuning
   - saturated profile: apply runtime fq qdisc/txqueuelen tuning
   - logrotate: rotate /var/log/XrayR/*.log at 50M, keep 3 compressed copies
   - journald: cap journal disk/memory usage without overwriting the main config
@@ -315,8 +315,21 @@ ForwardToWall=no'
   write_file "/etc/systemd/journald.conf.d/99-xrayr-optimize.conf" "$content"
 }
 
+install_conntrack_module() {
+  write_file "/etc/modules-load.d/xrayr-conntrack.conf" "nf_conntrack"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "DRY-RUN: would load nf_conntrack module"
+    return 0
+  fi
+
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe nf_conntrack >/dev/null 2>&1 || log "nf_conntrack module could not be loaded; sysctl will apply if the kernel exposes it"
+  fi
+}
+
 install_sysctl() {
   local cc extra="" backlog syn_backlog somax local_range fin_timeout keepalive_time rmem_max wmem_max netdev_budget=""
+  local conntrack_max conntrack_est conntrack_time_wait conntrack_close_wait conntrack_fin_wait conntrack_udp
   cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
   if printf '%s' "$cc" | grep -qw bbr; then
     extra='
@@ -336,6 +349,12 @@ net.ipv4.tcp_congestion_control = bbr'
       keepalive_time=600
       rmem_max=67108864
       wmem_max=67108864
+      conntrack_max=65536
+      conntrack_est=86400
+      conntrack_time_wait=30
+      conntrack_close_wait=30
+      conntrack_fin_wait=30
+      conntrack_udp=60
       ;;
     balanced)
       backlog=250000
@@ -349,6 +368,12 @@ net.ipv4.tcp_congestion_control = bbr'
       netdev_budget='
 net.core.netdev_budget = 600
 net.core.netdev_budget_usecs = 8000'
+      conntrack_max=131072
+      conntrack_est=43200
+      conntrack_time_wait=20
+      conntrack_close_wait=20
+      conntrack_fin_wait=20
+      conntrack_udp=45
       ;;
     saturated)
       backlog=500000
@@ -362,12 +387,25 @@ net.core.netdev_budget_usecs = 8000'
       netdev_budget='
 net.core.netdev_budget = 1200
 net.core.netdev_budget_usecs = 10000'
+      conntrack_max=262144
+      conntrack_est=21600
+      conntrack_time_wait=15
+      conntrack_close_wait=15
+      conntrack_fin_wait=15
+      conntrack_udp=30
       ;;
   esac
 
   local content
   content="# Managed by xrayr-optimize
 fs.file-max = 1048576
+net.netfilter.nf_conntrack_max = ${conntrack_max}
+net.netfilter.nf_conntrack_tcp_timeout_established = ${conntrack_est}
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = ${conntrack_time_wait}
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = ${conntrack_close_wait}
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = ${conntrack_fin_wait}
+net.netfilter.nf_conntrack_udp_timeout = ${conntrack_udp}
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
 net.core.somaxconn = ${somax}
 net.core.netdev_max_backlog = ${backlog}
 net.ipv4.ip_local_port_range = ${local_range}
@@ -383,6 +421,15 @@ net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}${netdev_budget}${extra}"
   write_file "/etc/sysctl.d/99-xrayr-performance.conf" "$content"
+}
+
+print_conntrack_status() {
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  if [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    log "conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+  else
+    log "conntrack: not exposed by this kernel"
+  fi
 }
 
 detect_default_iface() {
@@ -457,6 +504,7 @@ apply_changes() {
   install_systemd_dropin
   install_logrotate
   install_journald_limits
+  install_conntrack_module
   install_sysctl
   install_tc_service
   truncate_xrayr_logs
@@ -483,6 +531,7 @@ apply_changes
 log "done"
 if [ "$DRY_RUN" -eq 0 ]; then
   systemctl is-active "$SERVICE_UNIT" >/dev/null 2>&1 && log "${SERVICE_UNIT} active" || log "${SERVICE_UNIT} not active; check: systemctl status ${SERVICE_UNIT}"
+  print_conntrack_status
   df -h / | awk 'NR==1 || NR==2 {print}'
   log "rollback command: bash ${BACKUP_DIR}/rollback.sh"
 fi
